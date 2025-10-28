@@ -1,8 +1,8 @@
 // /api/wave/create-invoice.js
-// Requiere en Vercel:
+// ENV requeridas en Vercel:
 // WAVE_TOKEN, WAVE_BUSINESS_ID, WAVE_CURRENCY=USD
-// TAX_RATE=0.0825 (ej.), TAX_APPLIES=after-discount|before-discount
-// WAVE_PRODUCT_ID_SERVICE, WAVE_PRODUCT_ID_DISCOUNT, WAVE_PRODUCT_ID_TAX, WAVE_PRODUCT_ID_ADDON
+// WAVE_PRODUCT_ID_SERVICE, WAVE_PRODUCT_ID_ADDON, WAVE_PRODUCT_ID_TAX
+// TAX_RATE (ej. 0.0825) y TAX_APPLIES = 'after-discount' | 'before-discount'
 
 export const config = { runtime: 'nodejs' };
 
@@ -22,7 +22,6 @@ async function wave(query, variables, token) {
   return json.data;
 }
 
-// Queries / Mutations
 const Q_GET_CUSTOMER_BY_EMAIL = `
 query GetCustomer($businessId: ID!, $email: String!) {
   business(id: $businessId) {
@@ -59,14 +58,6 @@ mutation Approve($input: InvoiceApproveInput!) {
   }
 }`;
 
-const M_SEND = `
-mutation Send($input: InvoiceSendInput!) {
-  invoiceSend(input:$input) {
-    didSucceed
-    inputErrors { code message path }
-  }
-}`;
-
 const toMoneyStr = n => Number(n || 0).toFixed(2);
 
 // Normaliza addons a [{name, price}]
@@ -85,7 +76,7 @@ function normalizeAddons(addons) {
 }
 
 export default async function handler(req, res) {
-  // CORS
+  // CORS / OPTIONS
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
@@ -101,22 +92,17 @@ export default async function handler(req, res) {
   const token = process.env.WAVE_TOKEN;
   const businessId = process.env.WAVE_BUSINESS_ID;
   const currency = process.env.WAVE_CURRENCY || 'USD';
-  const TAX_RATE = Number(process.env.TAX_RATE || 0);
-  const TAX_MODE = (process.env.TAX_APPLIES || 'after-discount').toLowerCase();
-
-  const PID_SERVICE  = process.env.WAVE_PRODUCT_ID_SERVICE;
-  const PID_DISCOUNT = process.env.WAVE_PRODUCT_ID_DISCOUNT;
-  const PID_TAX      = process.env.WAVE_PRODUCT_ID_TAX;
-  const PID_ADDON    = process.env.WAVE_PRODUCT_ID_ADDON;
+  const PID_SERVICE = process.env.WAVE_PRODUCT_ID_SERVICE;
+  const PID_ADDON   = process.env.WAVE_PRODUCT_ID_ADDON;
+  const PID_TAX     = process.env.WAVE_PRODUCT_ID_TAX;
+  const TAX_RATE    = Number(process.env.TAX_RATE || 0);
+  const TAX_MODE    = (process.env.TAX_APPLIES || 'after-discount').toLowerCase();
 
   if (!token || !businessId) {
     return res.status(500).json({ ok:false, error:'Wave not configured (WAVE_TOKEN / WAVE_BUSINESS_ID missing)' });
   }
-  if (!PID_SERVICE || !PID_DISCOUNT || !PID_TAX || !PID_ADDON) {
-    return res.status(500).json({
-      ok:false,
-      error:'Missing product IDs. Set WAVE_PRODUCT_ID_SERVICE, WAVE_PRODUCT_ID_DISCOUNT, WAVE_PRODUCT_ID_TAX, WAVE_PRODUCT_ID_ADDON'
-    });
+  if (!PID_SERVICE || !PID_ADDON || !PID_TAX) {
+    return res.status(500).json({ ok:false, error:'Missing product IDs. Set WAVE_PRODUCT_ID_SERVICE, WAVE_PRODUCT_ID_ADDON, WAVE_PRODUCT_ID_TAX' });
   }
 
   try {
@@ -125,14 +111,16 @@ export default async function handler(req, res) {
       pkg, mainBar, secondEnabled, secondBar, secondSize,
       fountainEnabled, fountainSize, fountainType,
       addons = [],
-      discountApplied = 0,
-      total = 0,
-      deposit = 0, balance = 0,
+      // descuento desde UI manager
+      discountMode = 'amount',   // 'amount' | 'percent' | 'none'
+      discountValue = 0,
+      // Totales que ya calculas en UI (usados como base y memo)
+      total = 0, deposit = 0, balance = 0,
       payMode = 'deposit', notes = '',
       dateISO, startISO, hours = 0
     } = req.body || {};
 
-    // 1) Customer
+    // 1) Customer (busca por email; si no, lo crea)
     let customerId = null;
     if (email) {
       const found = await wave(Q_GET_CUSTOMER_BY_EMAIL, { businessId, email }, token);
@@ -148,47 +136,34 @@ export default async function handler(req, res) {
       customerId = out.customerCreate.customer.id;
     }
 
-    // 2) Totales
+    // 2) Calcular impuesto como línea positiva (según TAX_RATE y TAX_APPLIES)
     const addonsNorm = normalizeAddons(addons);
-    const subtotal = Number(total || 0);
-    const discountAmt = Number(discountApplied || 0);
+    const subtotalBase = Number(total || 0) + addonsNorm.reduce((s,a)=>s + Number(a.price || 0), 0);
+
+    let discountAmt = 0;
+    if (discountMode === 'amount') {
+      discountAmt = Math.max(0, Number(discountValue || 0));
+    } else if (discountMode === 'percent') {
+      const pct = Math.max(0, Number(discountValue || 0));
+      discountAmt = +(subtotalBase * (pct/100)).toFixed(2);
+    }
 
     const taxableBase = TAX_MODE === 'before-discount'
-      ? Math.max(0, subtotal)
-      : Math.max(0, subtotal - discountAmt);
+      ? Math.max(0, subtotalBase)
+      : Math.max(0, subtotalBase - discountAmt);
 
     const taxAmount = +(taxableBase * TAX_RATE).toFixed(2);
-    const grand = +(taxableBase + taxAmount).toFixed(2);
 
-    // 3) Items con productId
+    // 3) Construir items
     const items = [];
 
-    // Booking total
+    // Línea principal (solo el booking "total" sin add-ons)
     items.push({
       productId: PID_SERVICE,
-      description: `Booking total — ${mainBar || 'Service'} (${pkg || ''})`,
+      description: `Booking — ${mainBar || 'Service'}${pkg ? ` (${pkg})` : ''}`,
       quantity: 1,
-      unitPrice: toMoneyStr(subtotal)
+      unitPrice: toMoneyStr(total)
     });
-
-    if (discountAmt > 0) {
-      items.push({
-        productId: PID_DISCOUNT,
-        description: 'Discount',
-        quantity: 1,
-        unitPrice: toMoneyStr(-Math.abs(discountAmt))
-      });
-    }
-
-    if (TAX_RATE > 0) {
-      const pctTxt = (TAX_RATE * 100).toFixed(2).replace(/\.00$/, '');
-      items.push({
-        productId: PID_TAX,
-        description: `Sales Tax (${pctTxt}%)`,
-        quantity: 1,
-        unitPrice: toMoneyStr(taxAmount)
-      });
-    }
 
     // Add-ons
     addonsNorm.forEach(a => {
@@ -200,7 +175,25 @@ export default async function handler(req, res) {
       });
     });
 
-    // 4) Crear y aprobar
+    // Sales Tax como línea positiva
+    if (TAX_RATE > 0 && taxAmount > 0) {
+      const pctTxt = (TAX_RATE * 100).toFixed(2).replace(/\.00$/, '');
+      items.push({
+        productId: PID_TAX,
+        description: `Sales Tax (${pctTxt}%)`,
+        quantity: 1,
+        unitPrice: toMoneyStr(taxAmount)
+      });
+    }
+
+    // 4) Descuento nativo (sin línea negativa)
+    const invoiceDiscounts = [];
+    if (discountMode === 'amount' && discountAmt > 0) {
+      invoiceDiscounts.push({ name: 'Manager Discount', discountType: 'FIXED', amount: toMoneyStr(discountAmt) });
+    } else if (discountMode === 'percent' && Number(discountValue) > 0) {
+      invoiceDiscounts.push({ name: 'Manager Discount', discountType: 'PERCENTAGE', percentage: Number(discountValue) });
+    }
+
     const invoiceInput = {
       businessId,
       customerId,
@@ -218,14 +211,15 @@ export default async function handler(req, res) {
         `Pay mode: ${payMode}`,
         `Deposit: $${toMoneyStr(deposit)}`,
         `Balance: $${toMoneyStr(balance)}`,
-        `Tax mode: ${TAX_MODE}`
+        `Tax applies: ${TAX_MODE}`
       ].filter(Boolean).join('\n'),
       items: items.map(li => ({
         productId: li.productId,
         description: li.description,
         quantity: 1,
         unitPrice: String(li.unitPrice)
-      }))
+      })),
+      invoiceDiscounts: invoiceDiscounts.length ? invoiceDiscounts : undefined
     };
 
     const created = await wave(M_CREATE_INVOICE, { input: invoiceInput }, token);
@@ -244,27 +238,16 @@ export default async function handler(req, res) {
       throw new Error('invoiceApprove: ' + errs);
     }
 
-    // (Opcional) enviar
-    // if (email) {
-    //   const sent = await wave(M_SEND, { input: { businessId, invoiceId, to: [email], sendMethod: "ALL" } }, token);
-    //   if (!sent?.invoiceSend?.didSucceed) {
-    //     console.warn('invoiceSend failed', sent?.invoiceSend?.inputErrors);
-    //   }
-    // }
+    // Totales informativos
+    const totals = {
+      subtotalBase: toMoneyStr(subtotalBase),
+      discount: toMoneyStr(discountAmt),
+      taxableBase: toMoneyStr(taxableBase),
+      tax: toMoneyStr(taxAmount),
+      grand: toMoneyStr(taxableBase + taxAmount - discountAmt) // Wave recalcula internamente; esto es referencia
+    };
 
-    return res.json({
-      ok: true,
-      invoiceId,
-      viewUrl,
-      pdfUrl,
-      totals: {
-        subtotal: toMoneyStr(subtotal),
-        discount: toMoneyStr(discountAmt),
-        taxableBase: toMoneyStr(taxableBase),
-        tax: toMoneyStr(taxAmount),
-        grand: toMoneyStr(grand)
-      }
-    });
+    return res.json({ ok: true, invoiceId, viewUrl, pdfUrl, totals });
 
   } catch (err) {
     console.error('[wave/create-invoice] error:', err);
