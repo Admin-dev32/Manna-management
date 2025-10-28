@@ -1,107 +1,91 @@
-// /api/wave.js  (o /api/wave/index.js en carpetas)
-// Vercel Node.js Serverless Function
+// /api/wave.js  (o /api/wave/index.js)
+// Vercel Serverless Function — Integración Wave (unificada)
 
-// =============== C O N F I G ==================
 const WAVE_GQL = 'https://gql.waveapps.com/graphql/public';
 
-// =============== U T I L S ====================
+/* -------------------- Utils -------------------- */
 function json(res, code, body) {
-  // CORS siempre
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
   res.status(code).json(body);
 }
 
-function toBase64(s) {
-  return Buffer.from(s, 'utf8').toString('base64');
-}
-function fromBase64(s) {
-  return Buffer.from(s, 'base64').toString('utf8');
-}
+function toBase64(s) { return Buffer.from(s, 'utf8').toString('base64'); }
+function fromBase64(s) { return Buffer.from(s, 'base64').toString('utf8'); }
+
 function looksLikeGlobalBusinessId(bid) {
-  // Global ID Relay comienza por "Business:" → en base64 usualmente empieza con "QnVzaW5lc3M6"
   return typeof bid === 'string' && bid.startsWith('QnVzaW5lc3M6');
 }
 function ensureBusinessIdB64(envVal) {
-  // Acepta UUID (a72505eb-...) o Global ID (Base64)
   if (!envVal) throw new Error('WAVE_BUSINESS_ID no definido');
   if (looksLikeGlobalBusinessId(envVal)) return envVal;
-  // si parece UUID (contiene guiones), construir "Business:<uuid>" y b64
   if (envVal.includes('-')) return toBase64(`Business:${envVal}`);
-  // fallback: si llega algo raro, lo dejamos tal cual
   return envVal;
 }
-
 function looksLikeGlobalCustomerId(id) {
   return typeof id === 'string' && id.startsWith('QnVzaW5lc3M6') && id.includes('O0N1c3RvbWVyO');
 }
 function normalizeCustomerId({ businessUuid, customerId }) {
-  if (!customerId) return null; // se resolverá por email si aplica
-  // ya es Global Relay ID?
+  if (!customerId) return null;
   if (looksLikeGlobalCustomerId(customerId)) return customerId;
-  // si es numérico "98000498", creamos Business:<uuid>;Customer:<num> → base64
   if (/^\d+$/.test(customerId)) {
     const raw = `Business:${businessUuid};Customer:${customerId}`;
     return toBase64(raw);
   }
-  // si llega algo desconocido, lo retornamos tal cual (por si ya está bien)
   return customerId;
 }
-
 async function waveCall(token, query, variables) {
   const rsp = await fetch(WAVE_GQL, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, variables }),
   });
-  const json = await rsp.json();
-  if (json.errors) {
-    // Devuelve el primer error legible
-    const first = Array.isArray(json.errors) ? json.errors[0] : json.errors;
+  const j = await rsp.json();
+  if (j.errors) {
+    const first = Array.isArray(j.errors) ? j.errors[0] : j.errors;
     throw new Error(`Wave error: ${JSON.stringify(first)}`);
   }
-  return json.data;
+  return j.data;
+}
+function pick(n, def = 0) {
+  const v = parseFloat(n);
+  return Number.isFinite(v) ? v : def;
 }
 
-// =============== G Q L   D O C S ================
+/** Parse JSON body robusto (objeto, string o stream) */
+async function readBody(req) {
+  if (req.body && typeof req.body === 'object') return req.body;
+  if (typeof req.body === 'string') {
+    try { return JSON.parse(req.body); } catch { return {}; }
+  }
+  let raw = '';
+  for await (const chunk of req) raw += chunk;
+  if (!raw) return {};
+  try { return JSON.parse(raw); } catch { return {}; }
+}
+
+/* -------------------- GraphQL Docs -------------------- */
 const Q_BUSINESSES = `
 query {
-  businesses(page: 1, pageSize: 50) {
-    edges {
-      node { id name }
-    }
-  }
+  businesses(page: 1, pageSize: 50) { edges { node { id name } } }
 }`;
-
 const Q_BUSINESS = `
-query ($id: ID!) {
-  business(id: $id) { id name }
-}`;
-
+query ($id: ID!) { business(id: $id) { id name } }`;
 const Q_PRODUCTS = `
 query ($businessId: ID!) {
   business(id: $businessId) {
     id name
-    products(page: 1, pageSize: 200) {
-      edges { node { id name description } }
-    }
+    products(page: 1, pageSize: 200) { edges { node { id name description } } }
   }
 }`;
-
 const Q_TAXES = `
 query ($businessId: ID!) {
   business(id: $businessId) {
     id name
-    salesTaxes(page: 1, pageSize: 100) {
-      edges { node { id name rate } }
-    }
+    salesTaxes(page: 1, pageSize: 100) { edges { node { id name rate } } }
   }
 }`;
-
 const MUT_CUSTOMER_CREATE = `
 mutation TestCreateCustomer($input: CustomerCreateInput!) {
   customerCreate(input: $input) {
@@ -110,7 +94,6 @@ mutation TestCreateCustomer($input: CustomerCreateInput!) {
     customer { id name email }
   }
 }`;
-
 const MUT_INVOICE_CREATE = `
 mutation ($input: InvoiceCreateInput!) {
   invoiceCreate(input: $input) {
@@ -124,7 +107,6 @@ mutation ($input: InvoiceCreateInput!) {
     }
   }
 }`;
-
 const MUT_INVOICE_APPROVE = `
 mutation ($input: InvoiceApproveInput!) {
   invoiceApprove(input: $input) {
@@ -134,36 +116,8 @@ mutation ($input: InvoiceApproveInput!) {
   }
 }`;
 
-// =============== C O R E  L O G I C ============
-async function ensureCustomer({ token, businessIdB64, fullName, email }) {
-  // estrategia simple: si no hay email, crea uno throwaway para no fallar
-  const safeEmail = email && String(email).includes('@')
-    ? email
-    : `no-email+${Date.now()}@manna.local`;
-
-  const vars = {
-    input: {
-      businessId: businessIdB64,
-      name: fullName || 'Manna Booking',
-      email: safeEmail,
-    },
-  };
-  const data = await waveCall(token, MUT_CUSTOMER_CREATE, vars);
-  if (!data?.customerCreate?.didSucceed) {
-    const ie = data?.customerCreate?.inputErrors || [];
-    throw new Error(`customerCreate failed: ${JSON.stringify(ie)}`);
-  }
-  return data.customerCreate.customer.id;
-}
-
-function pick(n, def = 0) {
-  const v = parseFloat(n);
-  return Number.isFinite(v) ? v : def;
-}
-
+/* -------------------- Mappers/Derivadores -------------------- */
 function mapItemsToWave({ items, env, taxMode }) {
-  // items: [{ kind: "service"|"addon"|"discount"|"tax", description, unitPrice, quantity }]
-  // env: product ids + tax id opcional
   const out = [];
   for (const it of items || []) {
     const q = it.quantity == null ? 1 : it.quantity;
@@ -177,42 +131,46 @@ function mapItemsToWave({ items, env, taxMode }) {
     const line = {
       productId,
       description: it.description || undefined,
-      unitPrice: String(it.unitPrice), // Wave espera string decimal
+      unitPrice: String(it.unitPrice),
       quantity: q,
     };
-
-    // Impuesto nativo por renglón si hay WAVE_SALES_TAX_ID (solo si no es discount explícito negativo)
+    // impuesto nativo por renglón
     if (env.WAVE_SALES_TAX_ID && taxMode === 'native' && it.kind !== 'discount') {
       line.taxes = [{ salesTaxId: env.WAVE_SALES_TAX_ID }];
     }
-
     out.push(line);
   }
   return out;
 }
-
 function computeDerivedLines({ subtotal, discountMode, discountValue, taxRate, taxApplies }) {
   const sub = pick(subtotal);
   let discountLineAmount = 0;
   if (discountMode === 'amount')  discountLineAmount = pick(discountValue);
   if (discountMode === 'percent') discountLineAmount = sub * (pick(discountValue) / 100);
 
-  // impuesto como línea separada (si NO usamos impuesto nativo por renglón)
-  // TAX_APPLIES = 'before-discount' | 'after-discount'
   const baseTax = (taxApplies === 'before-discount')
     ? sub
     : Math.max(0, sub - discountLineAmount);
   const taxLineAmount = baseTax * pick(taxRate);
 
-  return {
-    discountLineAmount,
-    taxLineAmount,
-  };
+  return { discountLineAmount, taxLineAmount };
 }
 
-// =============== H A N D L E R =================
+async function ensureCustomer({ token, businessIdB64, fullName, email }) {
+  const safeEmail = (email && String(email).includes('@'))
+    ? email
+    : `no-email+${Date.now()}@manna.local`;
+  const vars = { input: { businessId: businessIdB64, name: fullName || 'Manna Booking', email: safeEmail } };
+  const data = await waveCall(token, MUT_CUSTOMER_CREATE, vars);
+  if (!data?.customerCreate?.didSucceed) {
+    const ie = data?.customerCreate?.inputErrors || [];
+    throw new Error(`customerCreate failed: ${JSON.stringify(ie)}`);
+  }
+  return data.customerCreate.customer.id;
+}
+
+/* -------------------- Handler -------------------- */
 export default async function handler(req, res) {
-  // CORS preflight
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
@@ -222,30 +180,30 @@ export default async function handler(req, res) {
 
   try {
     const action = (req.query.action || '').toString();
+    const body = await readBody(req);
 
     const env = {
       WAVE_TOKEN: process.env.WAVE_TOKEN,
-      WAVE_BUSINESS_ID: process.env.WAVE_BUSINESS_ID, // UUID o Base64
+      WAVE_BUSINESS_ID: process.env.WAVE_BUSINESS_ID,
       WAVE_CURRENCY: process.env.WAVE_CURRENCY || 'USD',
 
       WAVE_PRODUCT_ID_SERVICE: process.env.WAVE_PRODUCT_ID_SERVICE,
       WAVE_PRODUCT_ID_ADDON: process.env.WAVE_PRODUCT_ID_ADDON,
-      WAVE_PRODUCT_ID_DISCOUNT: process.env.WAVE_PRODUCT_ID_DISCOUNT, // opcional
+      WAVE_PRODUCT_ID_DISCOUNT: process.env.WAVE_PRODUCT_ID_DISCOUNT,
       WAVE_PRODUCT_ID_TAX: process.env.WAVE_PRODUCT_ID_TAX,
 
-      TAX_RATE: process.env.TAX_RATE, // ej. 0.0825
-      TAX_APPLIES: process.env.TAX_APPLIES || 'after-discount', // 'before-discount'|'after-discount'
-      WAVE_SALES_TAX_ID: process.env.WAVE_SALES_TAX_ID, // opcional: usa impuesto nativo por renglón
+      TAX_RATE: process.env.TAX_RATE,
+      TAX_APPLIES: process.env.TAX_APPLIES || 'after-discount',
+      WAVE_SALES_TAX_ID: process.env.WAVE_SALES_TAX_ID,
 
       WAVE_INVOICE_AUTO_APPROVE: process.env.WAVE_INVOICE_AUTO_APPROVE === 'true',
     };
 
     if (req.method === 'GET' && !action) {
-      // health básico
       return json(res, 200, { ok: true });
     }
 
-    // ------- acciones utilitarias -------
+    /* --- utils --- */
     if (action === 'env-check') {
       return json(res, 200, {
         ok: true,
@@ -291,45 +249,27 @@ export default async function handler(req, res) {
       return json(res, 200, { ok: true, business: data?.business, taxes });
     }
 
-    // ------- crear invoice -------
+    /* --- create-invoice --- */
     if (action === 'create-invoice') {
-      if (req.method !== 'POST') {
-        return json(res, 405, { ok: false, error: 'Method not allowed' });
-      }
+      if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'Method not allowed' });
 
       const businessUuid = env.WAVE_BUSINESS_ID.includes('-')
         ? env.WAVE_BUSINESS_ID
-        : fromBase64(env.WAVE_BUSINESS_ID).split(':')[1]; // "Business:<uuid>"
-
+        : fromBase64(env.WAVE_BUSINESS_ID).split(':')[1];
       const businessIdB64 = ensureBusinessIdB64(env.WAVE_BUSINESS_ID);
 
       const {
-        // cliente
         fullName, email, customerId,
-
-        // líneas (opción preferida: mandar items con price por renglón)
         items = [],
-
-        // alternativa: mandar resumen y que el server derive líneas
         pkgTotal, addonsTotal, discountMode, discountValue,
-
-        // impuestos
         currency = env.WAVE_CURRENCY || 'USD',
-
-        // metadata (opcional)
         venue, phone, dateISO, startISO, hours, notes,
-
-        // control interno UI
         total, deposit, balance, payMode,
-
-        // dry-run opcional
         dry
-      } = (req.body || {});
+      } = (body || {});
 
-      // Resolución de cliente:
       let customerGid = normalizeCustomerId({ businessUuid, customerId });
       if (!customerGid) {
-        // find-or-create por email
         customerGid = await ensureCustomer({
           token: env.WAVE_TOKEN,
           businessIdB64,
@@ -338,7 +278,6 @@ export default async function handler(req, res) {
         });
       }
 
-      // ¿usamos impuesto nativo o línea separada?
       const taxMode = env.WAVE_SALES_TAX_ID ? 'native' : 'line';
       const taxRate = env.TAX_RATE ? parseFloat(env.TAX_RATE) : 0;
       const taxApplies = env.TAX_APPLIES || 'after-discount';
@@ -346,12 +285,9 @@ export default async function handler(req, res) {
       let waveItems = [];
 
       if (items.length) {
-        // Manager manda líneas exactas (service/addon/discount/tax)
         waveItems = mapItemsToWave({ items, env, taxMode });
-        // Si el impuesto es por línea separada (no nativo), NO añadimos aquí;
-        // se agrega al final como línea "tax" con productId=WAVE_PRODUCT_ID_TAX.
+
         if (taxMode === 'line' && taxRate > 0) {
-          // calculamos base a partir de las líneas positivas (service+addons), y descontamos las negativas (discount)
           const positive = items
             .filter(x => x.kind !== 'discount')
             .reduce((a, b) => a + pick(b.unitPrice) * (b.quantity ?? 1), 0);
@@ -369,17 +305,11 @@ export default async function handler(req, res) {
           });
         }
       } else {
-        // Modo derivado: server arma líneas desde pkgTotal/addonsTotal/discount
         const sub = pick(pkgTotal) + pick(addonsTotal);
         const { discountLineAmount, taxLineAmount } = computeDerivedLines({
-          subtotal: sub,
-          discountMode,
-          discountValue,
-          taxRate,
-          taxApplies,
+          subtotal: sub, discountMode, discountValue, taxRate, taxApplies,
         });
 
-        // base (service) — usa WAVE_PRODUCT_ID_SERVICE
         if (pick(pkgTotal) > 0) {
           waveItems.push({
             productId: env.WAVE_PRODUCT_ID_SERVICE,
@@ -389,8 +319,6 @@ export default async function handler(req, res) {
             ...(taxMode === 'native' && env.WAVE_SALES_TAX_ID ? { taxes: [{ salesTaxId: env.WAVE_SALES_TAX_ID }] } : {})
           });
         }
-
-        // addons (si vienen totalizados, lo cargamos como una línea ADDON)
         if (pick(addonsTotal) > 0) {
           waveItems.push({
             productId: env.WAVE_PRODUCT_ID_ADDON,
@@ -400,8 +328,6 @@ export default async function handler(req, res) {
             ...(taxMode === 'native' && env.WAVE_SALES_TAX_ID ? { taxes: [{ salesTaxId: env.WAVE_SALES_TAX_ID }] } : {})
           });
         }
-
-        // descuento (línea negativa)
         if (discountLineAmount > 0) {
           waveItems.push({
             productId: env.WAVE_PRODUCT_ID_DISCOUNT || env.WAVE_PRODUCT_ID_ADDON,
@@ -410,8 +336,6 @@ export default async function handler(req, res) {
             quantity: 1
           });
         }
-
-        // impuesto como línea separada (si no usamos tax nativo)
         if (taxMode === 'line' && taxLineAmount > 0) {
           waveItems.push({
             productId: env.WAVE_PRODUCT_ID_TAX,
@@ -428,16 +352,13 @@ export default async function handler(req, res) {
           customerId: customerGid,
           currency,
           items: waveItems,
-          // Puedes agregar memo/notes si quieres concatenar metadatos:
-          // memo: `Venue: ${venue || ''}\nPhone: ${phone || ''}\nDate: ${dateISO || ''} ${startISO || ''}\nHours: ${hours || ''}\nNotes: ${notes || ''}`
+          // memo opcional:
+          // memo: `Venue: ${venue||''}\nPhone: ${phone||''}\nDate: ${dateISO||''} ${startISO||''}\nHours: ${hours||''}\nNotes: ${notes||''}`
         }
       };
 
-      if (dry) {
-        return json(res, 200, { ok: true, dryRun: true, variables });
-      }
+      if (dry) return json(res, 200, { ok: true, dryRun: true, variables });
 
-      // Crear invoice
       const data = await waveCall(env.WAVE_TOKEN, MUT_INVOICE_CREATE, variables);
       const result = data?.invoiceCreate;
       if (!result?.didSucceed) {
@@ -446,16 +367,11 @@ export default async function handler(req, res) {
 
       let invoice = result.invoice;
 
-      // Auto-approve (opcional por ENV)
       if (env.WAVE_INVOICE_AUTO_APPROVE && invoice?.id) {
         try {
           const approve = await waveCall(env.WAVE_TOKEN, MUT_INVOICE_APPROVE, { input: { invoiceId: invoice.id } });
-          if (approve?.invoiceApprove?.didSucceed) {
-            invoice.status = 'APPROVED';
-          }
+          if (approve?.invoiceApprove?.didSucceed) invoice.status = 'APPROVED';
         } catch (e) {
-          // no rompas si approve falla; devuelve creada en DRAFT
-          // eslint-disable-next-line no-console
           console.warn('invoiceApprove warning:', e.message);
         }
       }
@@ -463,7 +379,6 @@ export default async function handler(req, res) {
       return json(res, 200, { ok: true, invoice });
     }
 
-    // ------- ruta no reconocida -------
     return json(res, 400, { ok: false, error: 'Invalid action.' });
   } catch (e) {
     return json(res, 500, { ok: false, error: e.message || 'Internal Error.' });
