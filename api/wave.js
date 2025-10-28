@@ -1,9 +1,15 @@
 // /api/wave.js
-// Unifica utilidades y acciones de Wave en un solo Serverless Function (Hobby-safe).
-// ENV requeridas en Vercel (project "manna-management"):
+// Un único endpoint compatible con Vercel Hobby (1 función) que maneja:
+// GET  ?action=env-check
+// GET  ?action=ping
+// GET  ?action=schema-check
+// GET  ?action=list-businesses
+// POST { action:"create-invoice", ...payload }
+//
+// ENV requeridas:
 // - WAVE_TOKEN, WAVE_BUSINESS_ID, WAVE_CURRENCY=USD
 // - WAVE_PRODUCT_ID_SERVICE, WAVE_PRODUCT_ID_ADDON, WAVE_PRODUCT_ID_TAX
-// - TAX_RATE (p.ej. 0.0825)  |  TAX_APPLIES='after-discount' | 'before-discount'
+// - TAX_RATE (p.ej. 0.0825) y TAX_APPLIES = 'after-discount' | 'before-discount'
 
 export const config = { runtime: 'nodejs' };
 
@@ -53,11 +59,19 @@ function normalizeAddons(addons) {
   return String(addons).split(',').map(s => ({ name: s.trim(), price: 0 })).filter(a => a.name);
 }
 
-// ---------- GQL ----------
+// ---------- GraphQL ----------
 const Q_PING = `
 query Ping($businessId: ID!) {
   business(id: $businessId) { id name }
 }`;
+
+const Q_LIST_BUSINESSES = `
+query ListBusinesses {
+  businesses(page:1, pageSize:50) {
+    edges { node { id name } }
+  }
+}`;
+
 const Q_GET_CUSTOMER_BY_EMAIL = `
 query GetCustomer($businessId: ID!, $email: String!) {
   business(id: $businessId) {
@@ -66,6 +80,7 @@ query GetCustomer($businessId: ID!, $email: String!) {
     }
   }
 }`;
+
 const M_CREATE_CUSTOMER = `
 mutation CreateCustomer($input: CustomerCreateInput!) {
   customerCreate(input:$input) {
@@ -74,6 +89,7 @@ mutation CreateCustomer($input: CustomerCreateInput!) {
     customer { id name email }
   }
 }`;
+
 const M_CREATE_INVOICE = `
 mutation CreateInvoice($input: InvoiceCreateInput!) {
   invoiceCreate(input:$input) {
@@ -82,6 +98,7 @@ mutation CreateInvoice($input: InvoiceCreateInput!) {
     invoice { id status pdfUrl viewUrl }
   }
 }`;
+
 const M_APPROVE = `
 mutation Approve($input: InvoiceApproveInput!) {
   invoiceApprove(input:$input) {
@@ -118,8 +135,16 @@ async function actionPing() {
 }
 
 async function actionSchemaCheck() {
-  // Simplemente reutilizamos ping; si esto funciona, el token y business existen.
+  // Ping es suficiente para validar token+business reach.
   return actionPing();
+}
+
+async function actionListBusinesses() {
+  const token = process.env.WAVE_TOKEN;
+  if (!token) throw new Error('WAVE_TOKEN missing');
+  const data = await callWave(Q_LIST_BUSINESSES, {}, token);
+  const edges = data?.businesses?.edges || [];
+  return { ok: true, businesses: edges.map(e => e.node) };
 }
 
 async function actionCreateInvoice(payload) {
@@ -163,7 +188,7 @@ async function actionCreateInvoice(payload) {
     customerId = out.customerCreate.customer.id;
   }
 
-  // 2) Totales
+  // 2) Totales (tax como línea positiva; descuento nativo)
   const addonsNorm = normalizeAddons(addons);
   const addonsSum = addonsNorm.reduce((s,a)=> s + Number(a.price || 0), 0);
   const subtotalBase = Number(total || 0) + addonsSum;
@@ -279,15 +304,14 @@ export default async function handler(req, res) {
     if (cors(req, res)) return;
 
     const method = req.method;
-    // Soporta action por query (?action=...) o por body { action: '...' }
     const action = (req.query.action || (method === 'POST' && (req.body?.action)) || '').toString().toLowerCase();
 
     if (method === 'GET') {
-      if (action === 'env-check') return res.json(await actionEnvCheck());
-      if (action === 'ping') return res.json(await actionPing());
-      if (action === 'schema-check') return res.json(await actionSchemaCheck());
-      // default GET ping
-      return res.json({ ok:true, hint:'Add ?action=env-check | ping | schema-check or POST with action=create-invoice' });
+      if (action === 'env-check')       return res.json(await actionEnvCheck());
+      if (action === 'ping')            return res.json(await actionPing());
+      if (action === 'schema-check')    return res.json(await actionSchemaCheck());
+      if (action === 'list-businesses') return res.json(await actionListBusinesses());
+      return res.json({ ok:true, hint:'GET: ?action=env-check|ping|schema-check|list-businesses  •  POST: action=create-invoice' });
     }
 
     if (method === 'POST') {
