@@ -59,6 +59,20 @@ function normalizeAddons(addons) {
   return String(addons).split(',').map(s => ({ name: s.trim(), price: 0 })).filter(a => a.name);
 }
 
+// 👉 Normaliza el businessId: acepta UUID o Base64 ("Business:<uuid>" -> base64)
+function normalizeBusinessId(val) {
+  if (!val) return val;
+  // Si ya parece Base64 de "Business:", lo devolvemos tal cual
+  if (val.startsWith('QnVzaW5lc3M6')) return val;
+  // Si es UUID con guiones, lo convertimos a Base64 "Business:<uuid>"
+  if (val.includes('-')) {
+    // Node 18+ tiene Buffer disponible
+    return Buffer.from(`Business:${val}`).toString('base64');
+  }
+  // Cualquier otro formato: lo dejamos igual
+  return val;
+}
+
 // ---------- GraphQL ----------
 const Q_PING = `
 query Ping($businessId: ID!) {
@@ -128,14 +142,14 @@ async function actionEnvCheck() {
 
 async function actionPing() {
   const token = process.env.WAVE_TOKEN;
-  const businessId = process.env.WAVE_BUSINESS_ID;
+  const businessIdRaw = process.env.WAVE_BUSINESS_ID;
+  const businessId = normalizeBusinessId(businessIdRaw);
   if (!token || !businessId) throw new Error('WAVE_TOKEN/WAVE_BUSINESS_ID missing');
   const data = await callWave(Q_PING, { businessId }, token);
-  return { ok: true, business: data?.business };
+  return { ok: true, business: data?.business, usedBusinessId: businessId };
 }
 
 async function actionSchemaCheck() {
-  // Ping es suficiente para validar token+business reach.
   return actionPing();
 }
 
@@ -149,7 +163,7 @@ async function actionListBusinesses() {
 
 async function actionCreateInvoice(payload) {
   const token = process.env.WAVE_TOKEN;
-  const businessId = process.env.WAVE_BUSINESS_ID;
+  const businessId = normalizeBusinessId(process.env.WAVE_BUSINESS_ID);
   const currency = process.env.WAVE_CURRENCY || 'USD';
   const PID_SERVICE = process.env.WAVE_PRODUCT_ID_SERVICE;
   const PID_ADDON   = process.env.WAVE_PRODUCT_ID_ADDON;
