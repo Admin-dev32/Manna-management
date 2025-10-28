@@ -1,344 +1,471 @@
-// /api/wave.js
-// Un único endpoint compatible con Vercel Hobby (1 función) que maneja:
-// GET  ?action=env-check
-// GET  ?action=ping
-// GET  ?action=schema-check
-// GET  ?action=list-businesses
-// POST { action:"create-invoice", ...payload }
-//
-// ENV requeridas:
-// - WAVE_TOKEN, WAVE_BUSINESS_ID, WAVE_CURRENCY=USD
-// - WAVE_PRODUCT_ID_SERVICE, WAVE_PRODUCT_ID_ADDON, WAVE_PRODUCT_ID_TAX
-// - TAX_RATE (p.ej. 0.0825) y TAX_APPLIES = 'after-discount' | 'before-discount'
+// /api/wave.js  (o /api/wave/index.js en carpetas)
+// Vercel Node.js Serverless Function
 
-export const config = { runtime: 'nodejs' };
+// =============== C O N F I G ==================
+const WAVE_GQL = 'https://gql.waveapps.com/graphql/public';
 
-const WAVE_API = 'https://gql.waveapps.com/graphql/public';
-
-// ---------- helpers ----------
-function cors(req, res) {
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.status(204).end();
-    return true;
-  }
+// =============== U T I L S ====================
+function json(res, code, body) {
+  // CORS siempre
   res.setHeader('Access-Control-Allow-Origin', '*');
-  return false;
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.status(code).json(body);
 }
 
-async function callWave(query, variables, token) {
-  const rsp = await fetch(WAVE_API, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ query, variables })
-  });
-  const text = await rsp.text();
-  let json;
-  try { json = JSON.parse(text); } catch (e) {
-    throw new Error(`Wave HTTP ${rsp.status}: ${text}`);
+function toBase64(s) {
+  return Buffer.from(s, 'utf8').toString('base64');
+}
+function fromBase64(s) {
+  return Buffer.from(s, 'base64').toString('utf8');
+}
+function looksLikeGlobalBusinessId(bid) {
+  // Global ID Relay comienza por "Business:" → en base64 usualmente empieza con "QnVzaW5lc3M6"
+  return typeof bid === 'string' && bid.startsWith('QnVzaW5lc3M6');
+}
+function ensureBusinessIdB64(envVal) {
+  // Acepta UUID (a72505eb-...) o Global ID (Base64)
+  if (!envVal) throw new Error('WAVE_BUSINESS_ID no definido');
+  if (looksLikeGlobalBusinessId(envVal)) return envVal;
+  // si parece UUID (contiene guiones), construir "Business:<uuid>" y b64
+  if (envVal.includes('-')) return toBase64(`Business:${envVal}`);
+  // fallback: si llega algo raro, lo dejamos tal cual
+  return envVal;
+}
+
+function looksLikeGlobalCustomerId(id) {
+  return typeof id === 'string' && id.startsWith('QnVzaW5lc3M6') && id.includes('O0N1c3RvbWVyO');
+}
+function normalizeCustomerId({ businessUuid, customerId }) {
+  if (!customerId) return null; // se resolverá por email si aplica
+  // ya es Global Relay ID?
+  if (looksLikeGlobalCustomerId(customerId)) return customerId;
+  // si es numérico "98000498", creamos Business:<uuid>;Customer:<num> → base64
+  if (/^\d+$/.test(customerId)) {
+    const raw = `Business:${businessUuid};Customer:${customerId}`;
+    return toBase64(raw);
   }
-  if (!rsp.ok || json.errors) {
-    const errs = json.errors?.map(e => JSON.stringify(e)).join(' | ') || `HTTP ${rsp.status}`;
-    throw new Error(`Wave error: ${errs}`);
+  // si llega algo desconocido, lo retornamos tal cual (por si ya está bien)
+  return customerId;
+}
+
+async function waveCall(token, query, variables) {
+  const rsp = await fetch(WAVE_GQL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = await rsp.json();
+  if (json.errors) {
+    // Devuelve el primer error legible
+    const first = Array.isArray(json.errors) ? json.errors[0] : json.errors;
+    throw new Error(`Wave error: ${JSON.stringify(first)}`);
   }
   return json.data;
 }
 
-const toMoneyStr = n => Number(n || 0).toFixed(2);
-function normalizeAddons(addons) {
-  if (!addons) return [];
-  if (Array.isArray(addons)) {
-    return addons.map(a => {
-      if (typeof a === 'string') return { name: a.trim(), price: 0 };
-      if (typeof a === 'object' && a) return { name: String(a.name || '').trim(), price: Number(a.price || 0) };
-      return null;
-    }).filter(Boolean);
-  }
-  return String(addons).split(',').map(s => ({ name: s.trim(), price: 0 })).filter(a => a.name);
-}
-
-// 👉 Normaliza el businessId: acepta UUID o Base64 ("Business:<uuid>" -> base64)
-function normalizeBusinessId(val) {
-  if (!val) return val;
-  // Si ya parece Base64 de "Business:", lo devolvemos tal cual
-  if (val.startsWith('QnVzaW5lc3M6')) return val;
-  // Si es UUID con guiones, lo convertimos a Base64 "Business:<uuid>"
-  if (val.includes('-')) {
-    // Node 18+ tiene Buffer disponible
-    return Buffer.from(`Business:${val}`).toString('base64');
-  }
-  // Cualquier otro formato: lo dejamos igual
-  return val;
-}
-
-// ---------- GraphQL ----------
-const Q_PING = `
-query Ping($businessId: ID!) {
-  business(id: $businessId) { id name }
-}`;
-
-const Q_LIST_BUSINESSES = `
-query ListBusinesses {
-  businesses(page:1, pageSize:50) {
-    edges { node { id name } }
-  }
-}`;
-
-const Q_GET_CUSTOMER_BY_EMAIL = `
-query GetCustomer($businessId: ID!, $email: String!) {
-  business(id: $businessId) {
-    customers(page:1, pageSize:1, email:$email) {
-      edges { node { id name email } }
+// =============== G Q L   D O C S ================
+const Q_BUSINESSES = `
+query {
+  businesses(page: 1, pageSize: 50) {
+    edges {
+      node { id name }
     }
   }
 }`;
 
-const M_CREATE_CUSTOMER = `
-mutation CreateCustomer($input: CustomerCreateInput!) {
-  customerCreate(input:$input) {
+const Q_BUSINESS = `
+query ($id: ID!) {
+  business(id: $id) { id name }
+}`;
+
+const Q_PRODUCTS = `
+query ($businessId: ID!) {
+  business(id: $businessId) {
+    id name
+    products(page: 1, pageSize: 200) {
+      edges { node { id name description } }
+    }
+  }
+}`;
+
+const Q_TAXES = `
+query ($businessId: ID!) {
+  business(id: $businessId) {
+    id name
+    salesTaxes(page: 1, pageSize: 100) {
+      edges { node { id name rate } }
+    }
+  }
+}`;
+
+const MUT_CUSTOMER_CREATE = `
+mutation TestCreateCustomer($input: CustomerCreateInput!) {
+  customerCreate(input: $input) {
     didSucceed
     inputErrors { code message path }
     customer { id name email }
   }
 }`;
 
-const M_CREATE_INVOICE = `
-mutation CreateInvoice($input: InvoiceCreateInput!) {
-  invoiceCreate(input:$input) {
+const MUT_INVOICE_CREATE = `
+mutation ($input: InvoiceCreateInput!) {
+  invoiceCreate(input: $input) {
     didSucceed
-    inputErrors { code message path }
-    invoice { id status pdfUrl viewUrl }
+    inputErrors { message code path }
+    invoice {
+      id status
+      total { value currency { code } }
+      taxTotal { value }
+      viewUrl pdfUrl
+    }
   }
 }`;
 
-const M_APPROVE = `
-mutation Approve($input: InvoiceApproveInput!) {
-  invoiceApprove(input:$input) {
+const MUT_INVOICE_APPROVE = `
+mutation ($input: InvoiceApproveInput!) {
+  invoiceApprove(input: $input) {
     didSucceed
-    inputErrors { code message path }
+    inputErrors { message code path }
     invoice { id status }
   }
 }`;
 
-// ---------- actions ----------
-async function actionEnvCheck() {
-  const present = (k) => Boolean(process.env[k] && String(process.env[k]).length > 0);
-  return {
-    ok: true,
-    report: {
-      WAVE_TOKEN: present('WAVE_TOKEN'),
-      WAVE_BUSINESS_ID: present('WAVE_BUSINESS_ID'),
-      WAVE_CURRENCY: present('WAVE_CURRENCY'),
-      WAVE_PRODUCT_ID_SERVICE: present('WAVE_PRODUCT_ID_SERVICE'),
-      WAVE_PRODUCT_ID_ADDON: present('WAVE_PRODUCT_ID_ADDON'),
-      WAVE_PRODUCT_ID_TAX: present('WAVE_PRODUCT_ID_TAX'),
-      TAX_RATE: present('TAX_RATE'),
-      TAX_APPLIES: present('TAX_APPLIES')
-    }
+// =============== C O R E  L O G I C ============
+async function ensureCustomer({ token, businessIdB64, fullName, email }) {
+  // estrategia simple: si no hay email, crea uno throwaway para no fallar
+  const safeEmail = email && String(email).includes('@')
+    ? email
+    : `no-email+${Date.now()}@manna.local`;
+
+  const vars = {
+    input: {
+      businessId: businessIdB64,
+      name: fullName || 'Manna Booking',
+      email: safeEmail,
+    },
   };
-}
-
-async function actionPing() {
-  const token = process.env.WAVE_TOKEN;
-  const businessIdRaw = process.env.WAVE_BUSINESS_ID;
-  const businessId = normalizeBusinessId(businessIdRaw);
-  if (!token || !businessId) throw new Error('WAVE_TOKEN/WAVE_BUSINESS_ID missing');
-  const data = await callWave(Q_PING, { businessId }, token);
-  return { ok: true, business: data?.business, usedBusinessId: businessId };
-}
-
-async function actionSchemaCheck() {
-  return actionPing();
-}
-
-async function actionListBusinesses() {
-  const token = process.env.WAVE_TOKEN;
-  if (!token) throw new Error('WAVE_TOKEN missing');
-  const data = await callWave(Q_LIST_BUSINESSES, {}, token);
-  const edges = data?.businesses?.edges || [];
-  return { ok: true, businesses: edges.map(e => e.node) };
-}
-
-async function actionCreateInvoice(payload) {
-  const token = process.env.WAVE_TOKEN;
-  const businessId = normalizeBusinessId(process.env.WAVE_BUSINESS_ID);
-  const currency = process.env.WAVE_CURRENCY || 'USD';
-  const PID_SERVICE = process.env.WAVE_PRODUCT_ID_SERVICE;
-  const PID_ADDON   = process.env.WAVE_PRODUCT_ID_ADDON;
-  const PID_TAX     = process.env.WAVE_PRODUCT_ID_TAX;
-  const TAX_RATE    = Number(process.env.TAX_RATE || 0);
-  const TAX_MODE    = (process.env.TAX_APPLIES || 'after-discount').toLowerCase();
-
-  if (!token || !businessId) throw new Error('Wave not configured (WAVE_TOKEN / WAVE_BUSINESS_ID missing)');
-  if (!PID_SERVICE || !PID_ADDON || !PID_TAX) throw new Error('Missing product IDs (SERVICE/ADDON/TAX)');
-
-  const {
-    fullName, email, phone, venue,
-    pkg, mainBar, secondEnabled, secondBar, secondSize,
-    fountainEnabled, fountainSize, fountainType,
-    addons = [],
-    discountMode = 'amount',
-    discountValue = 0,
-    total = 0, deposit = 0, balance = 0,
-    payMode = 'deposit', notes = '',
-    dateISO, startISO, hours = 0
-  } = payload || {};
-
-  // 1) Customer
-  let customerId = null;
-  if (email) {
-    const found = await callWave(Q_GET_CUSTOMER_BY_EMAIL, { businessId, email }, token);
-    customerId = found?.business?.customers?.edges?.[0]?.node?.id || null;
+  const data = await waveCall(token, MUT_CUSTOMER_CREATE, vars);
+  if (!data?.customerCreate?.didSucceed) {
+    const ie = data?.customerCreate?.inputErrors || [];
+    throw new Error(`customerCreate failed: ${JSON.stringify(ie)}`);
   }
-  if (!customerId) {
-    const input = { businessId, name: fullName || 'Booking Client', email: email || undefined, phone: phone || undefined };
-    const out = await callWave(M_CREATE_CUSTOMER, { input }, token);
-    if (!out.customerCreate?.didSucceed) {
-      const errs = out.customerCreate?.inputErrors?.map(e => `${e.path?.join('.')}: ${e.message}`).join(' | ') || 'failed';
-      throw new Error('customerCreate: ' + errs);
+  return data.customerCreate.customer.id;
+}
+
+function pick(n, def = 0) {
+  const v = parseFloat(n);
+  return Number.isFinite(v) ? v : def;
+}
+
+function mapItemsToWave({ items, env, taxMode }) {
+  // items: [{ kind: "service"|"addon"|"discount"|"tax", description, unitPrice, quantity }]
+  // env: product ids + tax id opcional
+  const out = [];
+  for (const it of items || []) {
+    const q = it.quantity == null ? 1 : it.quantity;
+    let productId = null;
+    if (it.kind === 'service')   productId = env.WAVE_PRODUCT_ID_SERVICE;
+    else if (it.kind === 'addon')    productId = env.WAVE_PRODUCT_ID_ADDON;
+    else if (it.kind === 'discount') productId = env.WAVE_PRODUCT_ID_DISCOUNT || env.WAVE_PRODUCT_ID_ADDON;
+    else if (it.kind === 'tax')      productId = env.WAVE_PRODUCT_ID_TAX;
+    if (!productId) throw new Error(`Unknown or missing productId for kind=${it.kind}`);
+
+    const line = {
+      productId,
+      description: it.description || undefined,
+      unitPrice: String(it.unitPrice), // Wave espera string decimal
+      quantity: q,
+    };
+
+    // Impuesto nativo por renglón si hay WAVE_SALES_TAX_ID (solo si no es discount explícito negativo)
+    if (env.WAVE_SALES_TAX_ID && taxMode === 'native' && it.kind !== 'discount') {
+      line.taxes = [{ salesTaxId: env.WAVE_SALES_TAX_ID }];
     }
-    customerId = out.customerCreate.customer.id;
+
+    out.push(line);
   }
+  return out;
+}
 
-  // 2) Totales (tax como línea positiva; descuento nativo)
-  const addonsNorm = normalizeAddons(addons);
-  const addonsSum = addonsNorm.reduce((s,a)=> s + Number(a.price || 0), 0);
-  const subtotalBase = Number(total || 0) + addonsSum;
+function computeDerivedLines({ subtotal, discountMode, discountValue, taxRate, taxApplies }) {
+  const sub = pick(subtotal);
+  let discountLineAmount = 0;
+  if (discountMode === 'amount')  discountLineAmount = pick(discountValue);
+  if (discountMode === 'percent') discountLineAmount = sub * (pick(discountValue) / 100);
 
-  let discountAmt = 0;
-  if (discountMode === 'amount') {
-    discountAmt = Math.max(0, Number(discountValue || 0));
-  } else if (discountMode === 'percent') {
-    const pct = Math.max(0, Number(discountValue || 0));
-    discountAmt = +(subtotalBase * (pct/100)).toFixed(2);
-  }
-
-  const taxableBase = TAX_MODE === 'before-discount'
-    ? Math.max(0, subtotalBase)
-    : Math.max(0, subtotalBase - discountAmt);
-
-  const taxAmount = +(taxableBase * TAX_RATE).toFixed(2);
-
-  // 3) Items
-  const items = [];
-  items.push({
-    productId: PID_SERVICE,
-    description: `Booking — ${mainBar || 'Service'}${pkg ? ` (${pkg})` : ''}`,
-    quantity: 1,
-    unitPrice: toMoneyStr(total)
-  });
-
-  addonsNorm.forEach(a => {
-    items.push({
-      productId: PID_ADDON,
-      description: `Add-on — ${a.name}`,
-      quantity: 1,
-      unitPrice: toMoneyStr(a.price || 0)
-    });
-  });
-
-  if (TAX_RATE > 0 && taxAmount > 0) {
-    const pctTxt = (TAX_RATE * 100).toFixed(2).replace(/\.00$/, '');
-    items.push({
-      productId: PID_TAX,
-      description: `Sales Tax (${pctTxt}%)`,
-      quantity: 1,
-      unitPrice: toMoneyStr(taxAmount)
-    });
-  }
-
-  const invoiceDiscounts = [];
-  if (discountMode === 'amount' && discountAmt > 0) {
-    invoiceDiscounts.push({ name: 'Manager Discount', discountType: 'FIXED', amount: toMoneyStr(discountAmt) });
-  } else if (discountMode === 'percent' && Number(discountValue) > 0) {
-    invoiceDiscounts.push({ name: 'Manager Discount', discountType: 'PERCENTAGE', percentage: Number(discountValue) });
-  }
-
-  const invoiceInput = {
-    businessId,
-    customerId,
-    currency,
-    status: "SAVED",
-    title: "Event Booking",
-    subhead: venue ? `Venue: ${venue}` : null,
-    invoiceDate: new Date().toISOString().slice(0,10),
-    dueDate: dateISO || new Date(Date.now() + 7 * 864e5).toISOString().slice(0,10),
-    memo: [
-      notes ? `Notes: ${notes}` : null,
-      dateISO ? `Event Date: ${dateISO}` : null,
-      startISO ? `Start: ${startISO}` : null,
-      hours ? `Service Hours: ${hours}` : null,
-      `Pay mode: ${payMode}`,
-      `Deposit: $${toMoneyStr(deposit)}`,
-      `Balance: $${toMoneyStr(balance)}`,
-      `Tax applies: ${TAX_MODE}`
-    ].filter(Boolean).join('\n'),
-    items: items.map(li => ({
-      productId: li.productId,
-      description: li.description,
-      quantity: 1,
-      unitPrice: String(li.unitPrice)
-    })),
-    invoiceDiscounts: invoiceDiscounts.length ? invoiceDiscounts : undefined
-  };
-
-  const created = await callWave(M_CREATE_INVOICE, { input: invoiceInput }, token);
-  const invOut = created.invoiceCreate;
-  if (!invOut?.didSucceed) {
-    const errs = invOut?.inputErrors?.map(e => `${e.path?.join('.')}: ${e.message}`).join(' | ') || 'failed';
-    throw new Error('invoiceCreate: ' + errs);
-  }
-  const invoiceId = invOut.invoice?.id;
-
-  const approved = await callWave(M_APPROVE, { input: { businessId, invoiceId } }, token);
-  if (!approved?.invoiceApprove?.didSucceed) {
-    const errs = approved?.invoiceApprove?.inputErrors?.map(e => `${e.path?.join('.')}: ${e.message}`).join(' | ') || 'failed';
-    throw new Error('invoiceApprove: ' + errs);
-  }
+  // impuesto como línea separada (si NO usamos impuesto nativo por renglón)
+  // TAX_APPLIES = 'before-discount' | 'after-discount'
+  const baseTax = (taxApplies === 'before-discount')
+    ? sub
+    : Math.max(0, sub - discountLineAmount);
+  const taxLineAmount = baseTax * pick(taxRate);
 
   return {
-    ok: true,
-    invoiceId,
-    viewUrl: invOut.invoice?.viewUrl || null,
-    pdfUrl: invOut.invoice?.pdfUrl || null,
-    totals: {
-      subtotalBase: toMoneyStr(subtotalBase),
-      discount: toMoneyStr(discountAmt),
-      taxableBase: toMoneyStr(taxableBase),
-      tax: toMoneyStr(taxAmount)
-    }
+    discountLineAmount,
+    taxLineAmount,
   };
 }
 
-// ---------- main handler ----------
+// =============== H A N D L E R =================
 export default async function handler(req, res) {
+  // CORS preflight
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+    return res.status(204).end();
+  }
+
   try {
-    if (cors(req, res)) return;
+    const action = (req.query.action || '').toString();
 
-    const method = req.method;
-    const action = (req.query.action || (method === 'POST' && (req.body?.action)) || '').toString().toLowerCase();
+    const env = {
+      WAVE_TOKEN: process.env.WAVE_TOKEN,
+      WAVE_BUSINESS_ID: process.env.WAVE_BUSINESS_ID, // UUID o Base64
+      WAVE_CURRENCY: process.env.WAVE_CURRENCY || 'USD',
 
-    if (method === 'GET') {
-      if (action === 'env-check')       return res.json(await actionEnvCheck());
-      if (action === 'ping')            return res.json(await actionPing());
-      if (action === 'schema-check')    return res.json(await actionSchemaCheck());
-      if (action === 'list-businesses') return res.json(await actionListBusinesses());
-      return res.json({ ok:true, hint:'GET: ?action=env-check|ping|schema-check|list-businesses  •  POST: action=create-invoice' });
+      WAVE_PRODUCT_ID_SERVICE: process.env.WAVE_PRODUCT_ID_SERVICE,
+      WAVE_PRODUCT_ID_ADDON: process.env.WAVE_PRODUCT_ID_ADDON,
+      WAVE_PRODUCT_ID_DISCOUNT: process.env.WAVE_PRODUCT_ID_DISCOUNT, // opcional
+      WAVE_PRODUCT_ID_TAX: process.env.WAVE_PRODUCT_ID_TAX,
+
+      TAX_RATE: process.env.TAX_RATE, // ej. 0.0825
+      TAX_APPLIES: process.env.TAX_APPLIES || 'after-discount', // 'before-discount'|'after-discount'
+      WAVE_SALES_TAX_ID: process.env.WAVE_SALES_TAX_ID, // opcional: usa impuesto nativo por renglón
+
+      WAVE_INVOICE_AUTO_APPROVE: process.env.WAVE_INVOICE_AUTO_APPROVE === 'true',
+    };
+
+    if (req.method === 'GET' && !action) {
+      // health básico
+      return json(res, 200, { ok: true });
     }
 
-    if (method === 'POST') {
-      if (action === 'create-invoice' || !action) {
-        const result = await actionCreateInvoice(req.body || {});
-        return res.json(result);
+    // ------- acciones utilitarias -------
+    if (action === 'env-check') {
+      return json(res, 200, {
+        ok: true,
+        report: {
+          WAVE_TOKEN: !!env.WAVE_TOKEN,
+          WAVE_BUSINESS_ID: !!env.WAVE_BUSINESS_ID,
+          WAVE_CURRENCY: !!env.WAVE_CURRENCY,
+          WAVE_PRODUCT_ID_SERVICE: !!env.WAVE_PRODUCT_ID_SERVICE,
+          WAVE_PRODUCT_ID_ADDON: !!env.WAVE_PRODUCT_ID_ADDON,
+          WAVE_PRODUCT_ID_DISCOUNT: !!env.WAVE_PRODUCT_ID_DISCOUNT,
+          WAVE_PRODUCT_ID_TAX: !!env.WAVE_PRODUCT_ID_TAX,
+          TAX_RATE: !!env.TAX_RATE,
+          TAX_APPLIES: !!env.TAX_APPLIES,
+          WAVE_SALES_TAX_ID: !!env.WAVE_SALES_TAX_ID,
+          WAVE_INVOICE_AUTO_APPROVE: env.WAVE_INVOICE_AUTO_APPROVE,
+        },
+      });
+    }
+
+    if (action === 'ping') {
+      const businessIdB64 = ensureBusinessIdB64(env.WAVE_BUSINESS_ID);
+      const data = await waveCall(env.WAVE_TOKEN, Q_BUSINESS, { id: businessIdB64 });
+      return json(res, 200, { ok: true, business: data.business, usedBusinessId: businessIdB64 });
+    }
+
+    if (action === 'list-businesses') {
+      const data = await waveCall(env.WAVE_TOKEN, Q_BUSINESSES, {});
+      const list = (data?.businesses?.edges || []).map(e => e.node);
+      return json(res, 200, { ok: true, businesses: list });
+    }
+
+    if (action === 'list-products') {
+      const businessIdB64 = ensureBusinessIdB64(env.WAVE_BUSINESS_ID);
+      const data = await waveCall(env.WAVE_TOKEN, Q_PRODUCTS, { businessId: businessIdB64 });
+      const prods = (data?.business?.products?.edges || []).map(e => e.node);
+      return json(res, 200, { ok: true, business: data?.business, products: prods });
+    }
+
+    if (action === 'list-taxes') {
+      const businessIdB64 = ensureBusinessIdB64(env.WAVE_BUSINESS_ID);
+      const data = await waveCall(env.WAVE_TOKEN, Q_TAXES, { businessId: businessIdB64 });
+      const taxes = (data?.business?.salesTaxes?.edges || []).map(e => e.node);
+      return json(res, 200, { ok: true, business: data?.business, taxes });
+    }
+
+    // ------- crear invoice -------
+    if (action === 'create-invoice') {
+      if (req.method !== 'POST') {
+        return json(res, 405, { ok: false, error: 'Method not allowed' });
       }
-      return res.status(400).json({ ok:false, error:'Unknown action for POST' });
+
+      const businessUuid = env.WAVE_BUSINESS_ID.includes('-')
+        ? env.WAVE_BUSINESS_ID
+        : fromBase64(env.WAVE_BUSINESS_ID).split(':')[1]; // "Business:<uuid>"
+
+      const businessIdB64 = ensureBusinessIdB64(env.WAVE_BUSINESS_ID);
+
+      const {
+        // cliente
+        fullName, email, customerId,
+
+        // líneas (opción preferida: mandar items con price por renglón)
+        items = [],
+
+        // alternativa: mandar resumen y que el server derive líneas
+        pkgTotal, addonsTotal, discountMode, discountValue,
+
+        // impuestos
+        currency = env.WAVE_CURRENCY || 'USD',
+
+        // metadata (opcional)
+        venue, phone, dateISO, startISO, hours, notes,
+
+        // control interno UI
+        total, deposit, balance, payMode,
+
+        // dry-run opcional
+        dry
+      } = (req.body || {});
+
+      // Resolución de cliente:
+      let customerGid = normalizeCustomerId({ businessUuid, customerId });
+      if (!customerGid) {
+        // find-or-create por email
+        customerGid = await ensureCustomer({
+          token: env.WAVE_TOKEN,
+          businessIdB64,
+          fullName,
+          email,
+        });
+      }
+
+      // ¿usamos impuesto nativo o línea separada?
+      const taxMode = env.WAVE_SALES_TAX_ID ? 'native' : 'line';
+      const taxRate = env.TAX_RATE ? parseFloat(env.TAX_RATE) : 0;
+      const taxApplies = env.TAX_APPLIES || 'after-discount';
+
+      let waveItems = [];
+
+      if (items.length) {
+        // Manager manda líneas exactas (service/addon/discount/tax)
+        waveItems = mapItemsToWave({ items, env, taxMode });
+        // Si el impuesto es por línea separada (no nativo), NO añadimos aquí;
+        // se agrega al final como línea "tax" con productId=WAVE_PRODUCT_ID_TAX.
+        if (taxMode === 'line' && taxRate > 0) {
+          // calculamos base a partir de las líneas positivas (service+addons), y descontamos las negativas (discount)
+          const positive = items
+            .filter(x => x.kind !== 'discount')
+            .reduce((a, b) => a + pick(b.unitPrice) * (b.quantity ?? 1), 0);
+          const negatives = items
+            .filter(x => x.kind === 'discount')
+            .reduce((a, b) => a + Math.abs(pick(b.unitPrice)) * (b.quantity ?? 1), 0);
+          const base = (taxApplies === 'before-discount') ? positive : Math.max(0, positive - negatives);
+          const taxAmt = base * taxRate;
+
+          waveItems.push({
+            productId: env.WAVE_PRODUCT_ID_TAX,
+            description: `Sales Tax (${(taxRate * 100).toFixed(2)}%)`,
+            unitPrice: String(taxAmt.toFixed(2)),
+            quantity: 1,
+          });
+        }
+      } else {
+        // Modo derivado: server arma líneas desde pkgTotal/addonsTotal/discount
+        const sub = pick(pkgTotal) + pick(addonsTotal);
+        const { discountLineAmount, taxLineAmount } = computeDerivedLines({
+          subtotal: sub,
+          discountMode,
+          discountValue,
+          taxRate,
+          taxApplies,
+        });
+
+        // base (service) — usa WAVE_PRODUCT_ID_SERVICE
+        if (pick(pkgTotal) > 0) {
+          waveItems.push({
+            productId: env.WAVE_PRODUCT_ID_SERVICE,
+            description: 'Service',
+            unitPrice: String(pick(pkgTotal).toFixed(2)),
+            quantity: 1,
+            ...(taxMode === 'native' && env.WAVE_SALES_TAX_ID ? { taxes: [{ salesTaxId: env.WAVE_SALES_TAX_ID }] } : {})
+          });
+        }
+
+        // addons (si vienen totalizados, lo cargamos como una línea ADDON)
+        if (pick(addonsTotal) > 0) {
+          waveItems.push({
+            productId: env.WAVE_PRODUCT_ID_ADDON,
+            description: 'Add-ons',
+            unitPrice: String(pick(addonsTotal).toFixed(2)),
+            quantity: 1,
+            ...(taxMode === 'native' && env.WAVE_SALES_TAX_ID ? { taxes: [{ salesTaxId: env.WAVE_SALES_TAX_ID }] } : {})
+          });
+        }
+
+        // descuento (línea negativa)
+        if (discountLineAmount > 0) {
+          waveItems.push({
+            productId: env.WAVE_PRODUCT_ID_DISCOUNT || env.WAVE_PRODUCT_ID_ADDON,
+            description: 'Discount',
+            unitPrice: String((-discountLineAmount).toFixed(2)),
+            quantity: 1
+          });
+        }
+
+        // impuesto como línea separada (si no usamos tax nativo)
+        if (taxMode === 'line' && taxLineAmount > 0) {
+          waveItems.push({
+            productId: env.WAVE_PRODUCT_ID_TAX,
+            description: `Sales Tax (${(taxRate * 100).toFixed(2)}%)`,
+            unitPrice: String(pick(taxLineAmount).toFixed(2)),
+            quantity: 1
+          });
+        }
+      }
+
+      const variables = {
+        input: {
+          businessId: businessIdB64,
+          customerId: customerGid,
+          currency,
+          items: waveItems,
+          // Puedes agregar memo/notes si quieres concatenar metadatos:
+          // memo: `Venue: ${venue || ''}\nPhone: ${phone || ''}\nDate: ${dateISO || ''} ${startISO || ''}\nHours: ${hours || ''}\nNotes: ${notes || ''}`
+        }
+      };
+
+      if (dry) {
+        return json(res, 200, { ok: true, dryRun: true, variables });
+      }
+
+      // Crear invoice
+      const data = await waveCall(env.WAVE_TOKEN, MUT_INVOICE_CREATE, variables);
+      const result = data?.invoiceCreate;
+      if (!result?.didSucceed) {
+        return json(res, 400, { ok: false, error: 'invoiceCreate failed', inputErrors: result?.inputErrors || [] });
+      }
+
+      let invoice = result.invoice;
+
+      // Auto-approve (opcional por ENV)
+      if (env.WAVE_INVOICE_AUTO_APPROVE && invoice?.id) {
+        try {
+          const approve = await waveCall(env.WAVE_TOKEN, MUT_INVOICE_APPROVE, { input: { invoiceId: invoice.id } });
+          if (approve?.invoiceApprove?.didSucceed) {
+            invoice.status = 'APPROVED';
+          }
+        } catch (e) {
+          // no rompas si approve falla; devuelve creada en DRAFT
+          // eslint-disable-next-line no-console
+          console.warn('invoiceApprove warning:', e.message);
+        }
+      }
+
+      return json(res, 200, { ok: true, invoice });
     }
 
-    return res.status(405).json({ ok:false, error:'Method not allowed' });
-  } catch (err) {
-    console.error('[api/wave] crash:', err);
-    return res.status(500).json({ ok:false, error:String(err.message) });
+    // ------- ruta no reconocida -------
+    return json(res, 400, { ok: false, error: 'Invalid action.' });
+  } catch (e) {
+    return json(res, 500, { ok: false, error: e.message || 'Internal Error.' });
   }
 }
