@@ -1,4 +1,3 @@
-// /api/_google.js
 import { google } from 'googleapis';
 
 export function getCalendarClient() {
